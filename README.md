@@ -1,4 +1,4 @@
-This repository contains a modified generate.py with some added featuers. Additional options can be viewed with generate.py -h
+This repository contains a modified generate.py with some added features. Additional options can be viewed with generate.py -h
 
 By default, a video and a <=8MB gif will be generated for the input prompt, in addition to the image itself.
 
