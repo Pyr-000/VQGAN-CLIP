@@ -9,6 +9,7 @@ The main additions include:
 * Generating a gif, with automatic skip rate to stay within a size limit
 * Video generation via ffmpeg (including adding the final image as a thumbnail)
 * CUDA device selection
+
 (A more complete documentation of changes may be added later)
 
 The original readme is available below, with only the 'Advanced options' section being updated.
