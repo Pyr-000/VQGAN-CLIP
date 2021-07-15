@@ -3,13 +3,13 @@ This repository contains a modified generate.py with some added features. Additi
 By default, a video and a <=8MB gif will be generated for the input prompt, in addition to the image itself.
 
 The main additions include:
-* negative prompts (via -np): accuracy for negative prompts is optimised to be as low as possible
+* Negative prompts (via -np): accuracy for negative prompts is optimised to be as low as possible
 * A learning rate scheduler
 * Allowing for a configurable amount of overtime to let the adaptive scheduler complete image generation
-* generating a gif, with automatic skip rate to stay within a size limit
-* video generation via ffmpeg (including adding the final image as a thumbnail)
-* cuda device selection
-(more complete documentation of changes may be added later)
+* Generating a gif, with automatic skip rate to stay within a size limit
+* Video generation via ffmpeg (including adding the final image as a thumbnail)
+* CUDA device selection
+(A more complete documentation of changes may be added later)
 
 The original readme is available below, with only the 'Advanced options' section being updated.
 
