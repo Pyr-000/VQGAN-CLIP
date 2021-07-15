@@ -19,8 +19,6 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torchvision import transforms
 from torchvision.transforms import functional as TF
-torch.backends.cudnn.benchmark = False	# NR: True is a bit faster, but can lead to OOM. False is also more deterministic.
-torch.use_deterministic_algorithms(False)
 
 from CLIP import clip
 import kornia.augmentation as K
@@ -30,13 +28,18 @@ import imageio
 from PIL import ImageFile, Image
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
+import glob
+import os
+import time
+output_frames=[]
+import subprocess as sp
 
 # Create the parser
 vq_parser = argparse.ArgumentParser(description='Image generation using VQGAN+CLIP')
 
 # Add the arguments
-vq_parser.add_argument("-p", "--prompts", type=str, help="Text prompts", default="A nerdy rodent", dest='prompts')
-vq_parser.add_argument("-o", "--output", type=str, help="Number of iterations", default="output.png", dest='output')
+vq_parser.add_argument("-p", "--prompts", type=str, help="Text prompts", default=None, dest='prompts')
+vq_parser.add_argument("-o", "--output", type=str, help="Output file", default="output", dest='output')
 vq_parser.add_argument("-i", "--iterations", type=int, help="Number of iterations", default=500, dest='max_iterations')
 vq_parser.add_argument("-ip", "--image_prompts", type=str, help="Image prompts / target image", default=[], dest='image_prompts')
 vq_parser.add_argument("-nps", "--noise_prompt_seeds", nargs="*", type=int, help="Noise prompt seeds", default=[], dest='noise_prompt_seeds')
@@ -47,24 +50,73 @@ vq_parser.add_argument("-iw", "--init_weight", type=float, help="Initial image w
 vq_parser.add_argument("-m", "--clip_model", type=str, help="CLIP model", default='ViT-B/32', dest='clip_model')
 vq_parser.add_argument("-conf", "--vqgan_config", type=str, help="VQGAN config", default=f'checkpoints/vqgan_imagenet_f16_16384.yaml', dest='vqgan_config')
 vq_parser.add_argument("-ckpt", "--vqgan_checkpoint", type=str, help="VQGAN checkpoint", default=f'checkpoints/vqgan_imagenet_f16_16384.ckpt', dest='vqgan_checkpoint')
-vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate", default=0.1, dest='step_size')
+# vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate", default=0.2, dest='step_size')
+# THIS DEFAULT LEARNING RATE IS INTENDED FOR USE WITH SOME FORM OF PLATEAU OPTIMISER!
+vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate - REDUCE IF lr_optimiser IS DISABLED", default=1000, dest='step_size')
+vq_parser.add_argument("-lrm", "--learning_rate_min", type=float, help="Minimum learning rate for cleanup (plateau) to reach", default=0.000005, dest='plateau_min_lr')
 vq_parser.add_argument("-cuts", "--num_cuts", type=int, help="Number of cuts", default=32, dest='cutn')
 vq_parser.add_argument("-cutp", "--cut_power", type=float, help="Cut power", default=1., dest='cut_pow')
-vq_parser.add_argument("-se", "--save_every", type=int, help="Save image iterations", default=50, dest='display_freq')
+vq_parser.add_argument("-se", "--save_every", type=int, help="Save image iterations", default=1, dest='display_freq')
 vq_parser.add_argument("-sd", "--seed", type=int, help="Seed", default=None, dest='seed')
-vq_parser.add_argument("-opt", "--optimiser", type=str, help="Optimiser (Adam, AdamW, Adagrad, Adamax) ", default='Adam', dest='optimiser')
+vq_parser.add_argument("-opt", "--optimiser", type=str, help="Optimiser (Adam, AdamW, Adagrad, Adamax, SGD) ", default='Adam', dest='optimiser')
+vq_parser.add_argument("-np", "--negative_prompt", type=str, help="Text prompts with negative optimisation", default=None, dest='negative_prompts')
+vq_parser.add_argument("-lo", "--lr_optimiser", type=str, help="Learning rate optimiser (None, Plateau, Anneal, Wave)", default="Plateau", dest='lr_opt')
+vq_parser.add_argument("-osq", "--optimal_sequence", help="Only output frames with new optimal loss", action='store_true', dest='opt_seq')
+# vq_parser.add_argument("-nov", "--no_overtime", help="Do not allow for some extra iterations during the cleanup (plateau) pass", action='store_true', dest='no_overtime')
+vq_parser.add_argument("-ovf", "--overtime_factor", type=float, help="Allow for some extra iterations during the cleanup (plateau) pass. Factor of iteration count.", default=0.25, dest='overtime_factor')
+vq_parser.add_argument("-nvd", "--no_video", help="Add a true video file as an output. Requires ffmpeg executable.", action='store_true', dest='no_video')
+vq_parser.add_argument("-sif", "--save_intermediate_frames", help="Re-save output png on every -se interval. Provides progress updates but slows down the process.", action='store_true', dest='save_intermediate')
+vq_parser.add_argument("-mgs", "--max_gif_size_mb", type=float, help="Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.", default=8, dest='max_gif_size_mb')
+vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_true', dest='no_cudnn_bench')
+vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device available and should be used.", default=0, dest='cuda_device_id')
 
 # Execute the parse_args() method
 args = vq_parser.parse_args()
+if not args.no_cudnn_bench:
+    print("Running cudnn benchmark to (hopefully) boost performance. Disable with -ncb")
+torch.backends.cudnn.benchmark = not args.no_cudnn_bench	# NR: True is a bit faster, but can lead to OOM. False is also more deterministic.
+torch.use_deterministic_algorithms(False)
+
+should_make_video = not args.no_video
+max_overtime = 1+args.overtime_factor
+plateau_min_lr = args.plateau_min_lr
+
+# make some of the string based option selector args case insensitive
+if args.lr_opt:
+    args.lr_opt = args.lr_opt.lower()
+if args.optimiser:
+    args.optimiser = args.optimiser.lower()
+
+if args.opt_seq:
+    print("output will only contain frames with new optimal loss")
+
+if not args.prompts and not args.negative_prompts:
+    args.prompts = "painting"
 
 # Split text prompts using the pipe character
 if args.prompts:
     args.prompts = [phrase.strip() for phrase in args.prompts.split("|")]
-    
+
+if args.negative_prompts:
+    args.negative_prompts = [phrase.strip() for phrase in args.negative_prompts.split("|")]
+
 # Split target images using the pipe character
 if args.image_prompts:
     args.image_prompts = args.image_prompts.split("|")
     args.image_prompts = [image.strip() for image in args.image_prompts]
+
+# init. output file timestamp
+timeObj = time.localtime(time.time())
+timestamp = '%d_%d_%d-%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday, timeObj.tm_hour, timeObj.tm_min, timeObj.tm_sec)
+png_file_path = "outputs/" + args.output + timestamp + ".png"
+# try to create 'outputs' folder if not present.
+try:
+    os.makedirs('outputs')
+except FileExistsError as e:
+    pass
+except Exception as e:
+    print(f"'outputs' folder could not be created: {e}")
+
 
 # Functions and classes
 def sinc(x):
@@ -249,9 +301,13 @@ def resize_image(image, out_size):
 
 
 # Do it
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device_name = f"cuda:{args.cuda_device_id}" if torch.cuda.is_available() else 'cpu'
+device = torch.device(device_name)
 model = load_vqgan_model(args.vqgan_config, args.vqgan_checkpoint).to(device)
 jit = True if float(torch.__version__[:3]) < 1.8 else False
+print("available CLIP models:")
+print(clip.available_models())
+print(f"using: {args.clip_model} (select a different model with -m)")
 perceptor = clip.load(args.clip_model, jit=jit)[0].eval().requires_grad_(False).to(device)
 
 # clock=deepcopy(perceptor.visual.positional_embedding.data)
@@ -311,22 +367,30 @@ pMs = []
 normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                   std=[0.26862954, 0.26130258, 0.27577711])
 
+
 # Set the optimiser
-if args.optimiser == "Adam":
+if args.optimiser == "adam":
     opt = optim.Adam([z], lr=args.step_size)		# LR=0.1    
-elif args.optimiser == "AdamW":
+elif args.optimiser == "adamw":
     opt = optim.AdamW([z], lr=args.step_size)		# LR=0.2    
-elif args.optimiser == "Adagrad":
+elif args.optimiser == "adagrad":
     opt = optim.Adagrad([z], lr=args.step_size)	# LR=0.5+
-elif args.optimiser == "Adamax":
+elif args.optimiser == "adamax":
     opt = optim.Adamax([z], lr=args.step_size)	# LR=0.2
+elif args.optimiser == "sgd":
+    args.step_size *= 5000
+    opt = optim.SGD([z], lr=args.step_size, momentum=1)
+else:
+    print("WARNING: unknown optimiser requested!")
 
 # Output for the user
-print('Using device:', device)
-print('Optimising using:', args.optimiser)
+print(f"Using device: {device} [{device_name}]")
+print(f"Optimising using: {opt}")
 
 if args.prompts:
-    print('Using text prompts:', args.prompts)  
+    print('Using text prompts:', args.prompts)
+if args.negative_prompts:
+     print('Using negative text prompts:', args.negative_prompts)
 if args.image_prompts:
     print('Using image prompts:', args.image_prompts)
 if args.init_image:
@@ -341,10 +405,21 @@ torch.manual_seed(seed)
 print('Using seed:', seed)
 
 
-for prompt in args.prompts:
-    txt, weight, stop = parse_prompt(prompt)
-    embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
-    pMs.append(Prompt(embed, weight, stop).to(device))
+if args.prompts:
+    for prompt in args.prompts:
+        txt, weight, stop = parse_prompt(prompt)
+        embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
+        pMs.append(Prompt(embed, weight, stop).to(device))
+
+# add negative prompts the same way as normal prompts
+# attach an attribute to mark them as negative for loss calculations
+if args.negative_prompts:
+    for prompt in args.negative_prompts:
+        txt, weight, stop = parse_prompt(prompt)
+        embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
+        pM = Prompt(embed, weight, stop).to(device)
+        setattr(pM, 'negative_prompt', True)
+        pMs.append(pM)
 
 for prompt in args.image_prompts:
     path, weight, stop = parse_prompt(prompt)
@@ -369,12 +444,65 @@ def synth(z):
     return clamp_with_grad(model.decode(z_q).add(1).div(2), 0, 1)
 
 
+global best_loss
+best_loss = 1
+global unsaved_best_loss_sequence
+unsaved_best_loss_sequence = False
+global last_saved_frame
+last_saved_frame = -9999
+global current_lr
+current_lr = args.step_size
+
+
 @torch.no_grad()
 def checkin(i, losses):
+    global best_loss
+    global current_lr
+    global unsaved_best_loss_sequence
+    global last_saved_frame
+    global generated_image
+
     losses_str = ', '.join(f'{loss.item():g}' for loss in losses)
-    tqdm.write(f'i: {i}, loss: {sum(losses).item():g}, losses: {losses_str}')
-    out = synth(z)
-    TF.to_pil_image(out[0].cpu()).save(args.output) 						
+    current_lr = opt.param_groups[0]['lr']
+    learning_rate_str = "{:.2e}".format(current_lr)
+    loss_value = sum(losses).item()
+
+    # if there is already an unsaved "best frame", or this is a new best frame, there will be an unsaved best frame
+    new_best_loss = loss_value < best_loss
+    unsaved_best_loss_sequence = unsaved_best_loss_sequence or new_best_loss
+
+    # don't waste time generating the image or checking in if it won't actually be required
+    is_final_frame = (i == args.max_iterations) or (i >= max_overtime*args.max_iterations)
+    not_opt_seq_but_timer = (i % args.display_freq == 0 or is_final_frame) and not args.opt_seq
+    if new_best_loss or not_opt_seq_but_timer:
+        tqdm.write(f'i: {i}, loss: {loss_value:g}, losses: {losses_str}, lr: {learning_rate_str}')
+        out = synth(z)
+
+        # if this image is a new best image or we reached this point due to the 'save every' timer, generate the image.
+        generated_image = TF.to_pil_image(out[0].cpu())
+
+        try:
+            # if intermediate frames should be saved as progress updates, write a png file
+            if args.save_intermediate:
+                generated_image.save(png_file_path)
+            best_loss = loss_value
+            # if this is a new best loss value, store it now.
+            # this is done here so that the value is only updated if saving was actually a success (if intermediate frames are saved).
+            if new_best_loss:
+                best_loss = loss_value
+        except Exception as e:
+            print(e)
+
+    # if this frame is supposed to be part of the sequence, either by being a new best, or because of the timer, add it.
+    try:
+        if i - last_saved_frame > args.display_freq and (unsaved_best_loss_sequence or not args.opt_seq):
+            last_saved_frame = i
+            unsaved_best_loss_sequence = False
+            # save individual frames
+            # generated_image.save("outputs/"+str(i).zfill(6)+".png")
+            output_frames.append(generated_image)
+    except Exception as e:
+        print(e)
 
 
 def ascend_txt():
@@ -388,22 +516,42 @@ def ascend_txt():
         # result.append(F.mse_loss(z, z_orig) * args.init_weight / 2)
         result.append(F.mse_loss(z, torch.zeros_like(z_orig)) * ((1/torch.tensor(i*2 + 1))*args.init_weight) / 2)
     for prompt in pMs:
-        result.append(prompt(iii))
+        # if a prompt was marked as negative, its effective loss goes up for a high accuracy of the prompt
+        # this is currently modelled by applying ln(2/x)
+        if getattr(prompt, 'negative_prompt', False):
+            result.append( torch.log(2/ prompt(iii)) )
+        else:
+            result.append(prompt(iii))
         
     img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
     img = np.transpose(img, (1, 2, 0))
-    #imageio.imwrite('./steps/' + str(i) + '.jpg', np.array(img))				# NR: Save image in steps dir - removed for now (can use for video)
 
     return result
 
 
+# plateau scheduler, minimum LR is set by an arg - reaching it is used as the exit condition for overtime
+sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=0.8, patience=3)
+
+# try annealing, see what happens?
+sched_anneal = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=75, T_mult=2, verbose=False)
+
+# cyclic LR
+# initial_learning_rate = opt.param_groups[0]['lr']
+# this one won't work with our default optimiser
+# sched_cycle = optim.lr_scheduler.CyclicLR(opt, base_lr=initial_learning_rate*(1/50), max_lr=initial_learning_rate*50, step_size_up=100)
+# use another annealer but without increasing steps to make a sort-of wave LR
+sched_wave = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=66, verbose=False)
+
+
 def train(i):
+    # run a step
     opt.zero_grad(set_to_none=True)
     lossAll = ascend_txt()
-    
-    if i % args.display_freq == 0:
-        checkin(i, lossAll)
-       
+
+    # perform checkin (save current frame, get metrics)
+    checkin(i, lossAll)
+
+    # calculate loss value, run optimiser
     loss = sum(lossAll)
     loss.backward()
     opt.step()
@@ -411,16 +559,134 @@ def train(i):
     with torch.no_grad():
         z.copy_(z.maximum(z_min).minimum(z_max))
 
+    # apply learning rate schedulers:
+    # for annealing, the final few iterations are used to 'clean up' the current image with plateau
+    if i > args.max_iterations * 0.8 and (args.lr_opt == "anneal" or args.lr_opt == "wave"):
+        sched_plateau.step(loss)
+    elif args.lr_opt == "anneal":
+        sched_anneal.step(i)
+    elif args.lr_opt == "wave":
+        sched_wave.step(i)
+    elif args.lr_opt == "plateau":
+        if i > int(args.max_iterations*0.25):
+            sched_plateau.step(loss)
+
 
 i = 0
 try:
     with tqdm() as pbar:
         while True:
             train(i)
-            if i == args.max_iterations:
-                break
+            if i >= args.max_iterations:
+                if (max_overtime > 1) and (args.lr_opt in ("anneal", "wave", "plateau")) and (round(current_lr, 8) > round(plateau_min_lr, 8)) and (i < args.max_iterations * max_overtime):
+                    # if overtime is allowed, some extra frames can be appended.
+                    if i == args.max_iterations:
+                        # only print this message once! (if overtime triggeres, but i is equal to max)
+                        print(f"\nplateau lr:{round(current_lr, 8)} still greater than min: {round(plateau_min_lr, 8)} allowing up to {max_overtime-1} overtime (until i: {int(args.max_iterations * max_overtime)}).")
+                        print("This factor can be changed with -ovf, set to 0 to disable.")
+                    # pass
+                else:
+                    break
             i += 1
             pbar.update()
 except KeyboardInterrupt:
     pass
 
+
+for i in range(1,5):
+    # attempt to save final image up to 5 times
+    try:
+        output_frames[-1].save(png_file_path)
+    except Exception as e:
+        print(e)
+        print(f"png save failed, attempt: {i+1} / 5")
+        time.sleep(1)
+        continue
+    break
+
+
+# function to write a list of frames to a gif file
+def gif_frames_to_file(frames, path):
+    for i in range(1,5):
+        # attempt to save gif up to 5 times
+        try:
+            # loop = 0 may be added to have the gif loop.
+            generated_image.save(fp=path, format='GIF', append_images=frames, save_all=True, duration=1, minimize_size=True)
+        except Exception as e:
+            print(e)
+            print(f"gif save failed, attempt: {i+1} / 5")
+            time.sleep(1)
+            continue
+        break
+
+# write the gif file. drop every n frames, increasing n, until the gif is small enough for the size limit
+try:
+    gif_frames = output_frames
+    gif_filename = "outputs/"+args.output+timestamp+".gif"
+    gif_frames_to_file(gif_frames, gif_filename)
+    gif_size = os.path.getsize(gif_filename)
+    skip_n = 0
+    max_gif_size_b = args.max_gif_size_mb *1024*1024
+    while gif_size > max_gif_size_b:
+        print(f"optimising gif size: skipping at a rate of {skip_n}")
+        # heuristically accelerate the process: if size is off by more than factor 10, double the amount of drops
+        # skip_n may not be multiplied if it is still zero
+        if (gif_size > max_gif_size_b * 10) and (skip_n > 0):
+            skip_n *= 2
+        else:
+            skip_n += 1
+        # put a copy of the last frame at the start. the final image acts as a 'thumbnail'
+        gif_frames = []
+        gif_frames.append(output_frames[-1])
+
+        for i in range(len(output_frames)):
+            # the first and last frames are always kept
+            if (i%skip_n == 0) or (i == 0) or (i == len(output_frames)-1):
+                gif_frames.append(output_frames[i])
+
+        # write the new sequence and check file size
+        gif_frames_to_file(gif_frames, gif_filename)
+        gif_size = os.path.getsize(gif_filename)
+    print(f"Skipping every {skip_n} frames to achieve gif size limit: {gif_size}/{max_gif_size_b} ({args.max_gif_size_mb}MB, configurable with -mgs)")
+except Exception as e:
+    exc_type, exc_obj, exc_tb = sys.exc_info()
+    print(e,exc_tb.tb_lineno)
+
+if should_make_video:
+    video_file_path = "outputs/"+args.output+timestamp
+    print("Calling ffmpeg for video creation... Video output can be disabled with -nvd.")
+    cmd_out = ['ffmpeg',
+           '-f', 'image2pipe',
+           '-vcodec', 'png',
+           '-r', '30',  # FPS 
+           '-i', '-',  # Indicated input comes from pipe 
+           '-qscale', '0',
+           video_file_path+"n.mp4"]
+    null_out = open(os.devnull, 'wb')
+    try:
+        pipe = sp.Popen(cmd_out, stdin=sp.PIPE, shell=False, stdout=null_out, stderr=null_out)
+    except FileNotFoundError as e:
+        print("Video creation requires ffmpeg executable! Install or place a ffmpeg binary in this folder.")
+        # simply exit with the error, there is no need to continue attempting to use ffmpeg
+        raise e
+
+    # add final frame to the front as a 'cover'
+    output_frames[-1].save(pipe.stdin, format='PNG')
+    for img in output_frames:
+        img.save(pipe.stdin, format='PNG')
+    pipe.stdin.close()
+    pipe.wait()
+    if pipe.returncode != 0:
+        print(sp.CalledProcessError(pipe.returncode, cmd_out))
+    else:
+        print("ffmpeg call returned code 0.")
+
+    print("Attaching final image as thumbnail via ffmpeg...")
+    cmd_out = ['ffmpeg', '-i', video_file_path+"n.mp4", '-i', png_file_path, '-map', '0', '-map', '1', '-c', 'copy', '-c:v:1', 'png', '-disposition:v:1', 'attached_pic', video_file_path+".mp4", '-y']
+    pipe = sp.Popen(cmd_out, stdin=sp.PIPE, shell=False, stdout=null_out, stderr=null_out)
+    pipe.wait()
+    if pipe.returncode != 0:
+        print(sp.CalledProcessError(pipe.returncode, cmd_out))
+    else:
+        print("ffmpeg call returned code 0. Removing intermediary file without thumbnail.")
+        os.remove(video_file_path+"n.mp4")
