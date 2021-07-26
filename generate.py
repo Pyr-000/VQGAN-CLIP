@@ -47,7 +47,7 @@ vq_parser.add_argument("-npw", "--noise_prompt_weights", nargs="*", type=float, 
 vq_parser.add_argument("-s", "--size", nargs=2, type=int, help="Image size (width height)", default=[512,512], dest='size')
 vq_parser.add_argument("-ii", "--init_image", type=str, help="Initial image", default=None, dest='init_image')
 vq_parser.add_argument("-iw", "--init_weight", type=float, help="Initial image weight", default=0., dest='init_weight')
-vq_parser.add_argument("-m", "--clip_model", type=str, help="CLIP model", default='ViT-B/32', dest='clip_model')
+vq_parser.add_argument("-m", "--clip_model", type=str, help="CLIP model", default='ViT-B/16', dest='clip_model')
 vq_parser.add_argument("-conf", "--vqgan_config", type=str, help="VQGAN config", default=f'checkpoints/vqgan_imagenet_f16_16384.yaml', dest='vqgan_config')
 vq_parser.add_argument("-ckpt", "--vqgan_checkpoint", type=str, help="VQGAN checkpoint", default=f'checkpoints/vqgan_imagenet_f16_16384.ckpt', dest='vqgan_checkpoint')
 # vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate", default=0.2, dest='step_size')
