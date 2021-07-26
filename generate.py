@@ -64,11 +64,11 @@ vq_parser.add_argument("-lo", "--lr_optimiser", type=str, help="Learning rate op
 vq_parser.add_argument("-osq", "--optimal_sequence", help="Only output frames with new optimal loss", action='store_true', dest='opt_seq')
 # vq_parser.add_argument("-nov", "--no_overtime", help="Do not allow for some extra iterations during the cleanup (plateau) pass", action='store_true', dest='no_overtime')
 vq_parser.add_argument("-ovf", "--overtime_factor", type=float, help="Allow for some extra iterations during the cleanup (plateau) pass. Factor of iteration count.", default=0.25, dest='overtime_factor')
-vq_parser.add_argument("-nvd", "--no_video", help="Add a true video file as an output. Requires ffmpeg executable.", action='store_true', dest='no_video')
+vq_parser.add_argument("-nvd", "--no_video", help="Do not add a true video file as an output. (Video requires ffmpeg executable.)", action='store_true', dest='no_video')
 vq_parser.add_argument("-sif", "--save_intermediate_frames", help="Re-save output png on every -se interval. Provides progress updates but slows down the process.", action='store_true', dest='save_intermediate')
 vq_parser.add_argument("-mgs", "--max_gif_size_mb", type=float, help="Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.", default=8, dest='max_gif_size_mb')
 vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_true', dest='no_cudnn_bench')
-vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device available and should be used.", default=0, dest='cuda_device_id')
+vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device is available and should be used.", default=0, dest='cuda_device_id')
 
 # Execute the parse_args() method
 args = vq_parser.parse_args()
