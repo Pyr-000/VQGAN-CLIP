@@ -9,6 +9,7 @@ The main additions include:
 * Generating a gif, with automatic skip rate to stay within a size limit
 * Video generation via ffmpeg (including adding the final image as a thumbnail)
 * CUDA device selection
+* Using the (now released) ViT-B/16 model by default (note: this will use more VRAM than ViT-B/32) 
 
 (A more complete documentation of changes may be added later)
 
@@ -118,77 +119,6 @@ Use `random.sh` to make a batch of images from random text. Edit the text and nu
 To view the available options, use "-h".
 ```
 python generate.py -h
-```
-
-```
-usage: generate.py [-h] [-p PROMPTS] [-o OUTPUT] [-i MAX_ITERATIONS] [-ip IMAGE_PROMPTS]
-                   [-nps [NOISE_PROMPT_SEEDS [NOISE_PROMPT_SEEDS ...]]]
-                   [-npw [NOISE_PROMPT_WEIGHTS [NOISE_PROMPT_WEIGHTS ...]]] [-s SIZE SIZE] [-ii INIT_IMAGE]
-                   [-iw INIT_WEIGHT] [-m CLIP_MODEL] [-conf VQGAN_CONFIG] [-ckpt VQGAN_CHECKPOINT] [-lr STEP_SIZE]
-                   [-lrm PLATEAU_MIN_LR] [-cuts CUTN] [-cutp CUT_POW] [-se DISPLAY_FREQ] [-sd SEED] [-opt OPTIMISER]
-                   [-np NEGATIVE_PROMPTS] [-lo LR_OPT] [-osq] [-ovf OVERTIME_FACTOR] [-nvd] [-sif]
-                   [-mgs MAX_GIF_SIZE_MB] [-ncb] [-cdi CUDA_DEVICE_ID]
-```
-
-```
-optional arguments:
-  -h, --help            show this help message and exit
-  -p PROMPTS, --prompts PROMPTS
-                        Text prompts
-  -o OUTPUT, --output OUTPUT
-                        Output file
-  -i MAX_ITERATIONS, --iterations MAX_ITERATIONS
-                        Number of iterations
-  -ip IMAGE_PROMPTS, --image_prompts IMAGE_PROMPTS
-                        Image prompts / target image
-  -nps [NOISE_PROMPT_SEEDS [NOISE_PROMPT_SEEDS ...]], --noise_prompt_seeds [NOISE_PROMPT_SEEDS [NOISE_PROMPT_SEEDS ...]]
-                        Noise prompt seeds
-  -npw [NOISE_PROMPT_WEIGHTS [NOISE_PROMPT_WEIGHTS ...]], --noise_prompt_weights [NOISE_PROMPT_WEIGHTS [NOISE_PROMPT_WEIGHTS ...]]
-                        Noise prompt weights
-  -s SIZE SIZE, --size SIZE SIZE
-                        Image size (width height)
-  -ii INIT_IMAGE, --init_image INIT_IMAGE
-                        Initial image
-  -iw INIT_WEIGHT, --init_weight INIT_WEIGHT
-                        Initial image weight
-  -m CLIP_MODEL, --clip_model CLIP_MODEL
-                        CLIP model
-  -conf VQGAN_CONFIG, --vqgan_config VQGAN_CONFIG
-                        VQGAN config
-  -ckpt VQGAN_CHECKPOINT, --vqgan_checkpoint VQGAN_CHECKPOINT
-                        VQGAN checkpoint
-  -lr STEP_SIZE, --learning_rate STEP_SIZE
-                        Learning rate - REDUCE IF lr_optimiser IS DISABLED
-  -lrm PLATEAU_MIN_LR, --learning_rate_min PLATEAU_MIN_LR
-                        Minimum learning rate for cleanup (plateau) to reach
-  -cuts CUTN, --num_cuts CUTN
-                        Number of cuts
-  -cutp CUT_POW, --cut_power CUT_POW
-                        Cut power
-  -se DISPLAY_FREQ, --save_every DISPLAY_FREQ
-                        Save image iterations
-  -sd SEED, --seed SEED
-                        Seed
-  -opt OPTIMISER, --optimiser OPTIMISER
-                        Optimiser (Adam, AdamW, Adagrad, Adamax, SGD)
-  -np NEGATIVE_PROMPTS, --negative_prompt NEGATIVE_PROMPTS
-                        Text prompts with negative optimisation
-  -lo LR_OPT, --lr_optimiser LR_OPT
-                        Learning rate optimiser (None, Plateau, Anneal, Wave)
-  -osq, --optimal_sequence
-                        Only output frames with new optimal loss
-  -ovf OVERTIME_FACTOR, --overtime_factor OVERTIME_FACTOR
-                        Allow for some extra iterations during the cleanup (plateau) pass. Factor of iteration count.
-  -nvd, --no_video      Add a true video file as an output. Requires ffmpeg executable.
-  -sif, --save_intermediate_frames
-                        Re-save output png on every -se interval. Provides progress updates but slows down the
-                        process.
-  -mgs MAX_GIF_SIZE_MB, --max_gif_size_mb MAX_GIF_SIZE_MB
-                        Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.
-  -ncb, --no_cudnn_benchmark
-                        Don't run cudnn benchmark (normally used to optimise processing performance)
-  -cdi CUDA_DEVICE_ID, --cuda_device_id CUDA_DEVICE_ID
-                        Set CUDA device ID. Only required if a secondary CUDA device available and should be used.
 ```
 
 # Citations
