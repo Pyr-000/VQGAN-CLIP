@@ -69,6 +69,8 @@ vq_parser.add_argument("-sif", "--save_intermediate_frames", help="Re-save outpu
 vq_parser.add_argument("-mgs", "--max_gif_size_mb", type=float, help="Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.", default=8, dest='max_gif_size_mb')
 vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_true', dest='no_cudnn_bench')
 vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device is available and should be used.", default=0, dest='cuda_device_id')
+vq_parser.add_argument("-pd", "--plateau_delay", type=float, help="Factor of overall iterations to wait until scheduler is applied in plateau", default=0.175, dest='plateau_delay')
+vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience value for plateau scheduler", default=3, dest='plateau_patience')
 
 # Execute the parse_args() method
 args = vq_parser.parse_args()
@@ -530,7 +532,7 @@ def ascend_txt():
 
 
 # plateau scheduler, minimum LR is set by an arg - reaching it is used as the exit condition for overtime
-sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=0.8, patience=3)
+sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=0.8, patience=args.plateau_patience)
 
 # try annealing, see what happens?
 sched_anneal = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=75, T_mult=2, verbose=False)
@@ -568,7 +570,7 @@ def train(i):
     elif args.lr_opt == "wave":
         sched_wave.step(i)
     elif args.lr_opt == "plateau":
-        if i > int(args.max_iterations*0.25):
+        if i > int(args.max_iterations*args.plateau_delay):
             sched_plateau.step(loss)
 
 
