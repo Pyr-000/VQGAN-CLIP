@@ -53,7 +53,7 @@ vq_parser.add_argument("-ckpt", "--vqgan_checkpoint", type=str, help="VQGAN chec
 # vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate", default=0.2, dest='step_size')
 # THIS DEFAULT LEARNING RATE IS INTENDED FOR USE WITH SOME FORM OF PLATEAU OPTIMISER!
 vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate - REDUCE IF lr_optimiser IS DISABLED", default=1000, dest='step_size')
-vq_parser.add_argument("-lrm", "--learning_rate_min", type=float, help="Minimum learning rate for cleanup (plateau) to reach", default=0.000005, dest='plateau_min_lr')
+vq_parser.add_argument("-lrm", "--learning_rate_min", type=float, help="Minimum learning rate for cleanup (plateau) to reach", default=5e-6, dest='plateau_min_lr')
 vq_parser.add_argument("-cuts", "--num_cuts", type=int, help="Number of cuts", default=32, dest='cutn')
 vq_parser.add_argument("-cutp", "--cut_power", type=float, help="Cut power", default=1., dest='cut_pow')
 vq_parser.add_argument("-se", "--save_every", type=int, help="Save image iterations", default=1, dest='display_freq')
@@ -71,6 +71,8 @@ vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn ben
 vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device is available and should be used.", default=0, dest='cuda_device_id')
 vq_parser.add_argument("-pd", "--plateau_delay", type=float, help="Factor of overall iterations to wait until scheduler is applied in plateau", default=0.175, dest='plateau_delay')
 vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience value for plateau scheduler", default=3, dest='plateau_patience')
+vq_parser.add_argument("-pf", "--plateau_factor", type=float, help="LR factor applied in a plateau step", default=0.8, dest='plateau_factor')
+vq_parser.add_argument("-pe", "--plateau_exit_early", help="Permit early exit if min lr is reached by plateau", action='store_true', dest='exit_early')
 
 # Execute the parse_args() method
 args = vq_parser.parse_args()
@@ -532,7 +534,7 @@ def ascend_txt():
 
 
 # plateau scheduler, minimum LR is set by an arg - reaching it is used as the exit condition for overtime
-sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=0.8, patience=args.plateau_patience)
+sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=args.plateau_factor, patience=args.plateau_patience)
 
 # try annealing, see what happens?
 sched_anneal = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=75, T_mult=2, verbose=False)
@@ -579,8 +581,8 @@ try:
     with tqdm() as pbar:
         while True:
             train(i)
-            if i >= args.max_iterations:
-                if (max_overtime > 1) and (args.lr_opt in ("anneal", "wave", "plateau")) and (round(current_lr, 8) > round(plateau_min_lr, 8)) and (i < args.max_iterations * max_overtime):
+            if (i >= args.max_iterations or args.exit_early):
+                if (max_overtime > 0) and (args.lr_opt in ("anneal", "wave", "plateau")) and (round(current_lr, 8) > round(plateau_min_lr, 8)) and (i < args.max_iterations * max_overtime):
                     # if overtime is allowed, some extra frames can be appended.
                     if i == args.max_iterations:
                         # only print this message once! (if overtime triggeres, but i is equal to max)
