@@ -4,6 +4,7 @@
 import argparse
 import math
 from pathlib import Path
+from typing import List
 from urllib.request import urlopen
 from tqdm import tqdm
 import sys
@@ -34,17 +35,19 @@ import time
 output_frames=[]
 import subprocess as sp
 
+import codecs
+
 # Create the parser
 vq_parser = argparse.ArgumentParser(description='Image generation using VQGAN+CLIP')
 
 # Add the arguments
-vq_parser.add_argument("-p", "--prompts", type=str, help="Text prompts", default=None, dest='prompts')
+vq_parser.add_argument("-p", "--prompts", type=str, help="Text prompts, can be split into separate with ||, can be sequenced with ||| (single pipe is interpreted as a normal input)", default=None, dest='prompts')
 vq_parser.add_argument("-o", "--output", type=str, help="Output file", default="output", dest='output')
 vq_parser.add_argument("-i", "--iterations", type=int, help="Number of iterations", default=500, dest='max_iterations')
 vq_parser.add_argument("-ip", "--image_prompts", type=str, help="Image prompts / target image", default=[], dest='image_prompts')
 vq_parser.add_argument("-nps", "--noise_prompt_seeds", nargs="*", type=int, help="Noise prompt seeds", default=[], dest='noise_prompt_seeds')
 vq_parser.add_argument("-npw", "--noise_prompt_weights", nargs="*", type=float, help="Noise prompt weights", default=[], dest='noise_prompt_weights')
-vq_parser.add_argument("-s", "--size", nargs=2, type=int, help="Image size (width height)", default=[512,512], dest='size')
+vq_parser.add_argument("-s", "--size", nargs=2, type=int, help="Image size (width height)", default=[416,304], dest='size')
 vq_parser.add_argument("-ii", "--init_image", type=str, help="Initial image", default=None, dest='init_image')
 vq_parser.add_argument("-iw", "--init_weight", type=float, help="Initial image weight", default=0., dest='init_weight')
 vq_parser.add_argument("-m", "--clip_model", type=str, help="CLIP model", default='ViT-B/16', dest='clip_model')
@@ -52,8 +55,8 @@ vq_parser.add_argument("-conf", "--vqgan_config", type=str, help="VQGAN config",
 vq_parser.add_argument("-ckpt", "--vqgan_checkpoint", type=str, help="VQGAN checkpoint", default=f'checkpoints/vqgan_imagenet_f16_16384.ckpt', dest='vqgan_checkpoint')
 # vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate", default=0.2, dest='step_size')
 # THIS DEFAULT LEARNING RATE IS INTENDED FOR USE WITH SOME FORM OF PLATEAU OPTIMISER!
-vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate - REDUCE IF lr_optimiser IS DISABLED", default=1000, dest='step_size')
-vq_parser.add_argument("-lrm", "--learning_rate_min", type=float, help="Minimum learning rate for cleanup (plateau) to reach", default=5e-6, dest='plateau_min_lr')
+vq_parser.add_argument("-lr", "--learning_rate", type=float, help="Learning rate. Leave 0 to auto-pick based on mode", default=0, dest='step_size')
+vq_parser.add_argument("-lrm", "--learning_rate_min", type=float, help="Minimum learning rate for cleanup (plateau) to reach", default=1e-4, dest='plateau_min_lr')
 vq_parser.add_argument("-cuts", "--num_cuts", type=int, help="Number of cuts", default=32, dest='cutn')
 vq_parser.add_argument("-cutp", "--cut_power", type=float, help="Cut power", default=1., dest='cut_pow')
 vq_parser.add_argument("-se", "--save_every", type=int, help="Save image iterations", default=1, dest='display_freq')
@@ -69,16 +72,27 @@ vq_parser.add_argument("-sif", "--save_intermediate_frames", help="Re-save outpu
 vq_parser.add_argument("-mgs", "--max_gif_size_mb", type=float, help="Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.", default=8, dest='max_gif_size_mb')
 vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_true', dest='no_cudnn_bench')
 vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device is available and should be used.", default=0, dest='cuda_device_id')
-vq_parser.add_argument("-pd", "--plateau_delay", type=float, help="Factor of overall iterations to wait until scheduler is applied in plateau", default=0.175, dest='plateau_delay')
-vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience value for plateau scheduler", default=3, dest='plateau_patience')
+vq_parser.add_argument("-pd", "--plateau_delay", type=float, help="Factor of overall iterations to wait until scheduler is applied in plateau", default=0.08, dest='plateau_delay')
+vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience value for plateau scheduler", default=1, dest='plateau_patience')
 vq_parser.add_argument("-pf", "--plateau_factor", type=float, help="LR factor applied in a plateau step", default=0.8, dest='plateau_factor')
-vq_parser.add_argument("-pe", "--plateau_exit_early", help="Permit early exit if min lr is reached by plateau", action='store_true', dest='exit_early')
+vq_parser.add_argument("-pne", "--plateau_no_exit_early", help="By default, early exit if min lr is reached by plateau is permitted", action='store_true', dest='exit_early')
+vq_parser.add_argument("-pfp", "--prompts_path", help="Read contents of a specified utf-8 text file for the -p (prompts) flag. Overwrites -p.", default=None, dest='prompts_path')
+
+timeObj = time.localtime(time.time())
+big_timestamp = '%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday)
 
 # Execute the parse_args() method
 args = vq_parser.parse_args()
 if not args.no_cudnn_bench:
     print("Running cudnn benchmark to (hopefully) boost performance. Disable with -ncb")
 torch.backends.cudnn.benchmark = not args.no_cudnn_bench	# NR: True is a bit faster, but can lead to OOM. False is also more deterministic.
+
+# flag is a "not"; default is to allow early exit
+if args.exit_early:
+    args.exit_early = False
+else:
+    args.exit_early = True
+
 torch.use_deterministic_algorithms(False)
 
 should_make_video = not args.no_video
@@ -94,25 +108,86 @@ if args.optimiser:
 if args.opt_seq:
     print("output will only contain frames with new optimal loss")
 
+if args.prompts_path:
+    with codecs.open(args.prompts_path, mode="r", encoding="utf-8") as f:
+        args.prompts = f.read()
+
+# code was changed to allow prompts to contain ':'
+# feature was moved to '::'
+# args.prompts = args.prompts.replace(":", ";")
+
 if not args.prompts and not args.negative_prompts:
     args.prompts = "painting"
 
+multiple_prompts_exist = False
+multiprompt_iter = 0
+iter_per_half_cycle = 100
 # Split text prompts using the pipe character
 if args.prompts:
-    args.prompts = [phrase.strip() for phrase in args.prompts.split("|")]
+    multiprompts = [phrase.strip() for phrase in args.prompts.split("|||")]
+    # if only one prompt is specified, use the standard non-list representation
+    if len(multiprompts) <= 1:
+        args.prompts = multiprompts[0]
+        args.prompts = [phrase.strip() for phrase in args.prompts.split("||")]
+    else:
+        # for prompt sequence
+        multiple_prompts_exist = True
+        if args.lr_opt.lower() == 'plateau':
+            args.lr_opt = 'wave'
+            print("Swapping from plateau to wave lr for prompt sequence")
+        args.exit_early = False
+        for i in range(len(multiprompts)):
+            multiprompts[i] = [phrase.strip() for phrase in multiprompts[i].split("||")]
+        args.prompts = multiprompts[0]
+        iter_per_half_cycle = args.max_iterations / len(multiprompts) / 2
+        # args.max_iterations = iter_per_half_cycle * 1 + (2*(len(multiprompts)))*iter_per_half_cycle -1
+        print(f"Iterations per half-period for prompts: {iter_per_half_cycle}, overall iterations: {args.max_iterations}")
+
+# print(args.step_size)
+
+if args.step_size <= 0.0:
+    # print("ADJ")
+    # print(args.lr_opt)
+    # print("\n")
+    if args.lr_opt == "plateau":
+        args.step_size = 50
+        # print(args.step_size)
+    elif args.lr_opt == "wave":
+        args.step_size = 0.5
+    elif args.lr_opt == "anneal":
+        args.step_size = 1e1
+    else:
+        args.step_size = 1e-1
 
 if args.negative_prompts:
-    args.negative_prompts = [phrase.strip() for phrase in args.negative_prompts.split("|")]
+    args.negative_prompts = [phrase.strip() for phrase in args.negative_prompts.split("||")]
 
 # Split target images using the pipe character
 if args.image_prompts:
     args.image_prompts = args.image_prompts.split("|")
     args.image_prompts = [image.strip() for image in args.image_prompts]
 
+promptstring = ""
+if multiple_prompts_exist:
+    for item in multiprompts:
+        promptstring += ""+str(item)+" -> "
+    # remove trailing " -> "
+    promptstring = promptstring[:-4]
+else:
+    promptstring += str(args.prompts)
+if args.negative_prompts:
+    promptstring += " not " + str(args.negative_prompts)
+
+print(promptstring)
+
+sincos_scale_factor = (iter_per_half_cycle) / math.pi
+# lr_wave_lambda = lambda i : math.pow((math.pow(2,(math.cos(i/sincos_scale_factor)+1)) * math.cos(i/sincos_scale_factor)+1), 2.25)
+lr_wave_lambda = lambda i : math.pow((math.pow(2,(math.cos(i/sincos_scale_factor - math.pi)+1)) * math.cos(i/sincos_scale_factor - math.pi)+1), 2.25)
+
 # init. output file timestamp
 timeObj = time.localtime(time.time())
 timestamp = '%d_%d_%d-%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday, timeObj.tm_hour, timeObj.tm_min, timeObj.tm_sec)
-png_file_path = "outputs/" + args.output + timestamp + ".png"
+png_file_path = f"outputs/{big_timestamp}/" + args.output + timestamp + ".png"
 # try to create 'outputs' folder if not present.
 try:
     os.makedirs('outputs')
@@ -120,7 +195,12 @@ except FileExistsError as e:
     pass
 except Exception as e:
     print(f"'outputs' folder could not be created: {e}")
-
+try:
+    os.makedirs(f'outputs/{big_timestamp}')
+except FileExistsError as e:
+    pass
+except Exception as e:
+    print(f"'outputs/{big_timestamp}' folder could not be created: {e}")
 
 # Functions and classes
 def sinc(x):
@@ -218,7 +298,10 @@ class Prompt(nn.Module):
 
 
 def parse_prompt(prompt):
-    vals = prompt.rsplit(':', 2)
+    # altering this, to allow my prompts to contain ':'
+    # now requires :: to trigger
+    # vals = prompt.rsplit(':', 2)
+    vals = prompt.rsplit('::', 2)
     vals = vals + ['', '1', '-inf'][len(vals):]
     return vals[0], float(vals[1]), float(vals[2])
 
@@ -373,6 +456,7 @@ normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
 
 
 # Set the optimiser
+# print(args.step_size)
 if args.optimiser == "adam":
     opt = optim.Adam([z], lr=args.step_size)		# LR=0.1    
 elif args.optimiser == "adamw":
@@ -392,7 +476,10 @@ print(f"Using device: {device} [{device_name}]")
 print(f"Optimising using: {opt}")
 
 if args.prompts:
-    print('Using text prompts:', args.prompts)
+    if multiple_prompts_exist:
+        print('Using prompt sequence:', multiprompts)
+    else:
+        print('Using text prompts:', args.prompts)
 if args.negative_prompts:
      print('Using negative text prompts:', args.negative_prompts)
 if args.image_prompts:
@@ -408,37 +495,80 @@ else:
 torch.manual_seed(seed)
 print('Using seed:', seed)
 
+# print("plp", opt)
 
-if args.prompts:
-    for prompt in args.prompts:
-        txt, weight, stop = parse_prompt(prompt)
-        embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
+def load_prompts(i=0):
+    global multiprompt_iter
+    global pMs
+    global args
+    global multiple_prompts_exist
+    pMs = []
+    if args.prompts:
+        if multiple_prompts_exist:
+            multiprompt_iter = i
+            args.prompts = multiprompts[i]
+            if not isinstance(args.prompts, List):
+                args.prompts = [args.prompts]
+        else:
+            args.prompts = multiprompts[0]
+            if not isinstance(args.prompts, List):
+                args.prompts = [args.prompts]
+
+        new_prompts = []
+        for prompt in args.prompts:
+            if "||" in prompt:
+                split_prompt = [phrase.strip() for phrase in prompt.split("||")]
+                for new in split_prompt:
+                    new_prompts.append(new)
+            else:
+                new_prompts.append(prompt)
+        args.prompts = new_prompts
+
+        for prompt in args.prompts:
+            txt, weight, stop = parse_prompt(prompt)
+            try:
+                tokenized = clip.tokenize(txt, truncate=False)
+            except RuntimeError as re:
+                print(re)
+                print("Truncating input!")
+                tokenized = clip.tokenize(txt, truncate=True)
+            token_list = tokenized.tolist()[0]
+            token_decoder_dict = clip.clip._tokenizer.decoder
+            token_strings = [token_decoder_dict[t] for t in token_list]
+            # remove trailing padding for tokenization printout
+            last_idx = token_strings.index('<|endoftext|>')
+            token_strings = token_strings[:last_idx+1]
+            embed = perceptor.encode_text(tokenized.to(device)).float()
+            pMs.append(Prompt(embed, weight, stop).to(device))
+            # print(txt)
+            # tokenized length includes padding (full input length), token_strings has padding removed
+            print(f'\nPrompt: {txt}\n{token_strings}\nTokens: {len(token_strings)}/{len(tokenized[0])}')
+
+    # add negative prompts the same way as normal prompts
+    # attach an attribute to mark them as negative for loss calculations
+    if args.negative_prompts:
+        for prompt in args.negative_prompts:
+            txt, weight, stop = parse_prompt(prompt)
+            embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
+            pM = Prompt(embed, weight, stop).to(device)
+            setattr(pM, 'negative_prompt', True)
+            pMs.append(pM)
+
+    for prompt in args.image_prompts:
+        path, weight, stop = parse_prompt(prompt)
+        img = Image.open(path)
+        pil_image = img.convert('RGB')
+        img = resize_image(pil_image, (sideX, sideY))
+        batch = make_cutouts(TF.to_tensor(img).unsqueeze(0).to(device))
+        embed = perceptor.encode_image(normalize(batch)).float()
         pMs.append(Prompt(embed, weight, stop).to(device))
 
-# add negative prompts the same way as normal prompts
-# attach an attribute to mark them as negative for loss calculations
-if args.negative_prompts:
-    for prompt in args.negative_prompts:
-        txt, weight, stop = parse_prompt(prompt)
-        embed = perceptor.encode_text(clip.tokenize(txt).to(device)).float()
-        pM = Prompt(embed, weight, stop).to(device)
-        setattr(pM, 'negative_prompt', True)
-        pMs.append(pM)
+    for seed, weight in zip(args.noise_prompt_seeds, args.noise_prompt_weights):			# NR: weights
+        gen = torch.Generator().manual_seed(seed)
+        embed = torch.empty([1, perceptor.visual.output_dim]).normal_(generator=gen)
+        pMs.append(Prompt(embed, weight).to(device))
 
-for prompt in args.image_prompts:
-    path, weight, stop = parse_prompt(prompt)
-    img = Image.open(path)
-    pil_image = img.convert('RGB')
-    img = resize_image(pil_image, (sideX, sideY))
-    batch = make_cutouts(TF.to_tensor(img).unsqueeze(0).to(device))
-    embed = perceptor.encode_image(normalize(batch)).float()
-    pMs.append(Prompt(embed, weight, stop).to(device))
-
-for seed, weight in zip(args.noise_prompt_seeds, args.noise_prompt_weights):			# NR: weights
-    gen = torch.Generator().manual_seed(seed)
-    embed = torch.empty([1, perceptor.visual.output_dim]).normal_(generator=gen)
-    pMs.append(Prompt(embed, weight).to(device))
-
+load_prompts(0)
 
 def synth(z):
     if gumbel:
@@ -467,9 +597,15 @@ def checkin(i, losses):
     global generated_image
 
     losses_str = ', '.join(f'{loss.item():g}' for loss in losses)
+    # current_lr = opt.param_groups[0]['lr']
     current_lr = opt.param_groups[0]['lr']
+    # print(current_lr)
     learning_rate_str = "{:.2e}".format(current_lr)
-    loss_value = sum(losses).item()
+    # loss_value = 0.0
+    if isinstance(losses, float):
+        loss_value = losses
+    else:
+        loss_value = sum(losses).item()
 
     # if there is already an unsaved "best frame", or this is a new best frame, there will be an unsaved best frame
     new_best_loss = loss_value < best_loss
@@ -532,6 +668,9 @@ def ascend_txt():
 
     return result
 
+# print("before sched: ", args.step_size)
+
+# print("ps", opt)
 
 # plateau scheduler, minimum LR is set by an arg - reaching it is used as the exit condition for overtime
 sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=args.plateau_factor, patience=args.plateau_patience)
@@ -544,28 +683,37 @@ sched_anneal = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=75, T_mul
 # this one won't work with our default optimiser
 # sched_cycle = optim.lr_scheduler.CyclicLR(opt, base_lr=initial_learning_rate*(1/50), max_lr=initial_learning_rate*50, step_size_up=100)
 # use another annealer but without increasing steps to make a sort-of wave LR
-sched_wave = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=66, verbose=False)
+# sched_wave = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=66, verbose=False)
+if args.lr_opt == "wave":
+    # DO NOT INIT THE LAMBDA LR IF IT IS NOT USED. IT MAY NEVER BE STEPPED, BUT IT WILL SET LR TO IT f(0) ON INIT !!!
+    sched_wave = optim.lr_scheduler.LambdaLR(opt, lr_wave_lambda)
 
+# print("after sched: ", args.step_size)
 
 def train(i):
+    #print("zg", opt)
     # run a step
     opt.zero_grad(set_to_none=True)
     lossAll = ascend_txt()
-
+    #print("ci", opt)
     # perform checkin (save current frame, get metrics)
     checkin(i, lossAll)
 
     # calculate loss value, run optimiser
     loss = sum(lossAll)
     loss.backward()
+    # print("after loss: ", args.step_size)
+    #print("st", opt)
     opt.step()
+    #print("nd", opt)
     
     with torch.no_grad():
         z.copy_(z.maximum(z_min).minimum(z_max))
 
     # apply learning rate schedulers:
     # for annealing, the final few iterations are used to 'clean up' the current image with plateau
-    if i > args.max_iterations * 0.8 and (args.lr_opt == "anneal" or args.lr_opt == "wave"):
+    # print(i, loss, args.max_iterations, args.plateau_delay)
+    if (args.lr_opt == "anneal") and i > args.max_iterations * 0.8:
         sched_plateau.step(loss)
     elif args.lr_opt == "anneal":
         sched_anneal.step(i)
@@ -574,14 +722,31 @@ def train(i):
     elif args.lr_opt == "plateau":
         if i > int(args.max_iterations*args.plateau_delay):
             sched_plateau.step(loss)
-
+    global multiprompt_iter
+    global multiple_prompts_exist
+    if multiple_prompts_exist:
+        # print("multiple prompts!")
+        # target_prompt_idx = int((i-iter_per_half_cycle)/(iter_per_half_cycle*2))
+        # if target_prompt_idx > multiprompt_iter and target_prompt_idx < len(multiprompts):
+        #     load_prompts(target_prompt_idx)
+        # hacky solution instead!
+        # if int((i / iter_per_half_cycle + 1) / 2) > multiprompt_iter:
+        if int((i / iter_per_half_cycle) / 2) > multiprompt_iter:
+            if multiprompt_iter + 1 >= len(multiprompts):
+                # if no prompts are left, exit.
+                args.max_iterations = min(i,args.max_iterations)
+            else:
+                load_prompts(multiprompt_iter + 1)
 
 i = 0
+# print("before train: ", args.step_size)
+# print("pt", opt)
 try:
     with tqdm() as pbar:
         while True:
             train(i)
             if (i >= args.max_iterations or args.exit_early):
+                # if (max_overtime > 0) and (args.lr_opt in ("anneal", "wave", "plateau")) and (round(current_lr, 8) > round(plateau_min_lr, 8)) and (i < args.max_iterations * max_overtime):
                 if (max_overtime > 0) and (args.lr_opt in ("anneal", "wave", "plateau")) and (round(current_lr, 8) > round(plateau_min_lr, 8)) and (i < args.max_iterations * max_overtime):
                     # if overtime is allowed, some extra frames can be appended.
                     if i == args.max_iterations:
@@ -626,7 +791,7 @@ def gif_frames_to_file(frames, path):
 # write the gif file. drop every n frames, increasing n, until the gif is small enough for the size limit
 try:
     gif_frames = output_frames
-    gif_filename = "outputs/"+args.output+timestamp+".gif"
+    gif_filename = f"outputs/{big_timestamp}/"+args.output+timestamp+".gif"
     gif_frames_to_file(gif_frames, gif_filename)
     gif_size = os.path.getsize(gif_filename)
     skip_n = 0
@@ -657,7 +822,7 @@ except Exception as e:
     print(e,exc_tb.tb_lineno)
 
 if should_make_video:
-    video_file_path = "outputs/"+args.output+timestamp
+    video_file_path = f"outputs/{big_timestamp}/"+args.output+timestamp
     print("Calling ffmpeg for video creation... Video output can be disabled with -nvd.")
     cmd_out = ['ffmpeg',
            '-f', 'image2pipe',
@@ -694,3 +859,17 @@ if should_make_video:
     else:
         print("ffmpeg call returned code 0. Removing intermediary file without thumbnail.")
         os.remove(video_file_path+"n.mp4")
+
+print(promptstring)
+
+# try to create 'prompts_log' folder if not present.
+try:
+    os.makedirs('prompts_log')
+except FileExistsError as e:
+    pass
+except Exception as e:
+    print(f"'outputs' folder could not be created: {e}")
+
+with open(f"prompts_log/{big_timestamp}.log", "a") as f:
+    f.write(promptstring)
+    f.write("\n")
