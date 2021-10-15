@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import List
 from urllib.request import urlopen
+from torch.nn.modules.activation import GELU
 from tqdm import tqdm
 import sys
 sys.path.append('taming-transformers')
@@ -77,6 +78,13 @@ vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience val
 vq_parser.add_argument("-pf", "--plateau_factor", type=float, help="LR factor applied in a plateau step", default=0.8, dest='plateau_factor')
 vq_parser.add_argument("-pne", "--plateau_no_exit_early", help="By default, early exit if min lr is reached by plateau is permitted", action='store_true', dest='exit_early')
 vq_parser.add_argument("-pfp", "--prompts_path", help="Read contents of a specified utf-8 text file for the -p (prompts) flag. Overwrites -p.", default=None, dest='prompts_path')
+vq_parser.add_argument("-de", "--dropout_early", type=float, help="p-value for dropout on forward input (before augmentations or cutouts)", default=0.0, dest='dropout_early')
+vq_parser.add_argument("-di", "--dropout_item", type=float, help="p-value for dropout per cutout item, before pooling, augmentation", default=0.002, dest='dropout_item')
+vq_parser.add_argument("-dl", "--dropout_late", type=float, help="p-value for dropout after cutouts, pooling, augmentation", default=0.0, dest='dropout_late')
+vq_parser.add_argument("-dar", "--dropout_alpha_rate", type=float, help="p-value for dropouts to be AlphaDropout (over normal)", default=0.66, dest='dropout_alpha_prob')
+vq_parser.add_argument("-ath", "--apply_tanh_factor", type=float, help="rate for applying tanh to batch items on forward; high values seem to have an effect similar to 'hdr image' filters", default=0.5, dest='apply_tanh')
+vq_parser.add_argument("-nf", "--forward_noise_factor", type=float, help="noise factor applied on forward", default=0.01, dest='forward_noise_fac')
+vq_parser.add_argument("-mpw", "--max_pooling_weight", type=float, help="weight of max pooling vs average pooling [0..1]", default=0.5, dest='max_pooling_weight')
 
 timeObj = time.localtime(time.time())
 big_timestamp = '%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday)
@@ -150,10 +158,10 @@ if args.step_size <= 0.0:
     # print(args.lr_opt)
     # print("\n")
     if args.lr_opt == "plateau":
-        args.step_size = 50
+        args.step_size = 33
         # print(args.step_size)
     elif args.lr_opt == "wave":
-        args.step_size = 0.5
+        args.step_size = 0.66
     elif args.lr_opt == "anneal":
         args.step_size = 1e1
     else:
@@ -281,6 +289,19 @@ def vector_quantize(x, codebook):
     x_q = F.one_hot(indices, codebook.shape[0]).to(d.dtype) @ codebook
     return replace_grad(x_q, x)
 
+def stepify(input):
+    out = input
+    STEPS = 6
+    if STEPS > 0:
+        # minval = torch.min(out)
+        # out = out - minval
+        # max within the range > min
+        maxval = torch.max(out)
+        out = out / maxval
+        out = torch.trunc(out*STEPS+0.5)*(1/STEPS)
+        out = out * maxval
+        # out = out + minval
+    return out
 
 class Prompt(nn.Module):
     def __init__(self, embed, weight=1., stop=float('-inf')):
@@ -305,6 +326,44 @@ def parse_prompt(prompt):
     vals = vals + ['', '1', '-inf'][len(vals):]
     return vals[0], float(vals[1]), float(vals[2])
 
+class MaybeAct(nn.Module):
+    def __init__(self, act: nn.Module, p: float = 0.5):
+        super().__init__()
+        self.act = act
+        self.p = p
+    def forward(self, x):
+        if np.random.random() < self.p:
+            return self.act(x)
+        else:
+            return x
+
+# p -> 0: more of {left} | p -> 1: more of {right}
+class ParallelProcessing(nn.Module):
+    def __init__(self, left:nn.Module, right:nn.Module, p: float = 0.5):
+        super().__init__()
+        self.left = left
+        self.right = right
+        self.p = p
+    def forward(self, x):
+        if self.p >= 1:
+            return self.right(x)
+        elif self.p <= 0:
+            return self.left(x)
+        else:
+            return self.right(x)*self.p + self.left(x)*(1-self.p)
+
+class SwitchingDropout(ParallelProcessing):
+    def __init__(self, dropout_p: float = 0.5):
+        if dropout_p <= 0:
+            # if dropout is zero, 'soft-disable' the module.
+            normal = nn.Identity()
+            alpha = nn.Identity()
+            distr = 0
+        else:
+            normal = nn.Dropout(dropout_p)
+            alpha = nn.AlphaDropout(dropout_p)
+            distr = args.dropout_alpha_prob
+        super().__init__(normal, alpha, distr)
 
 class MakeCutouts(nn.Module):
     def __init__(self, cut_size, cutn, cut_pow=1.):
@@ -324,19 +383,46 @@ class MakeCutouts(nn.Module):
             K.RandomPerspective(0.7,p=0.7),
             K.ColorJitter(hue=0.1, saturation=0.1, p=0.7),
             K.RandomErasing((.1, .4), (.3, 1/.3), same_on_batch=True, p=0.7),
-            
-)
-        self.noise_fac = 0.1
+        )
+        # random chaos is introduced through dropouts, so this can be -> 0.
+        self.noise_fac = args.forward_noise_fac
         self.av_pool = nn.AdaptiveAvgPool2d((self.cut_size, self.cut_size))
         self.max_pool = nn.AdaptiveMaxPool2d((self.cut_size, self.cut_size))
+        self.pool = ParallelProcessing(self.av_pool, self.max_pool, args.max_pooling_weight)
+        # self.early_dropout = nn.Dropout(p=0.02)
+        # self.late_dropout = nn.Dropout(p=0.02)
+
+        # dropouts are only applied if their p-value is configured to be >0. otherwise leave them as identities
+        self.early_dropout = nn.Identity()
+        self.late_dropout = nn.Identity()
+        self.item_dropout = nn.Identity()
+        if args.dropout_early > 0:
+            self.early_dropout = SwitchingDropout(dropout_p=args.dropout_early)
+        if args.dropout_late > 0:
+            self.late_dropout = SwitchingDropout(dropout_p=args.dropout_late)
+        if args.dropout_item > 0:
+            self.item_dropout = SwitchingDropout(dropout_p=args.dropout_item)
+        self.apply_on_input = nn.Sequential(
+            self.early_dropout,
+        )
+        self.apply_per_batch_item = nn.Sequential(
+            # MaybeAct(nn.Tanh(), p=args.apply_tanh),
+            ParallelProcessing(nn.Identity(), nn.Tanh(), p=args.apply_tanh),
+            self.item_dropout,
+        )
+        apply_on_out_batch = nn.ModuleList([])
+        apply_on_out_batch.append(self.late_dropout)
+        self.apply_on_out_batch = nn.Sequential(*apply_on_out_batch)
 
     def forward(self, input):
+        input = self.apply_on_input(input)
         sideY, sideX = input.shape[2:4]
         max_size = min(sideX, sideY)
         min_size = min(sideX, sideY, self.cut_size)
         cutouts = []
         
         for _ in range(self.cutn):
+            cutout = input
 
             # size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
             # offsetx = torch.randint(0, sideX - size + 1, ())
@@ -344,14 +430,17 @@ class MakeCutouts(nn.Module):
             # cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
             # cutouts.append(resample(cutout, (self.cut_size, self.cut_size)))
 
-            # cutout = transforms.Resize(size=(self.cut_size, self.cut_size))(input)
-            
-            cutout = (self.av_pool(input) + self.max_pool(input))/2
+            # cutout = transforms.Resize(size=(self.cut_size, self.cut_size))(input)max_pooling_weight
+
+            #cutout = (self.av_pool(cutout) + self.max_pool(cutout))/2
+            cutout = self.pool(cutout)
+            cutout = self.apply_per_batch_item(cutout)
             cutouts.append(cutout)
         batch = self.augs(torch.cat(cutouts, dim=0))
         if self.noise_fac:
             facs = batch.new_empty([self.cutn, 1, 1, 1]).uniform_(0, self.noise_fac)
             batch = batch + facs * torch.randn_like(batch)
+        batch = self.apply_on_out_batch(batch)
         return batch
 
 
@@ -575,7 +664,9 @@ def synth(z):
         z_q = vector_quantize(z.movedim(1, 3), model.quantize.embed.weight).movedim(3, 1)
     else:
         z_q = vector_quantize(z.movedim(1, 3), model.quantize.embedding.weight).movedim(3, 1)
-    return clamp_with_grad(model.decode(z_q).add(1).div(2), 0, 1)
+    clamped = clamp_with_grad(model.decode(z_q).add(1).div(2), 0, 1)
+    # clamped = stepify(clamped)
+    return clamped
 
 
 global best_loss
@@ -617,7 +708,7 @@ def checkin(i, losses):
     if new_best_loss or not_opt_seq_but_timer:
         tqdm.write(f'i: {i}, loss: {loss_value:g}, losses: {losses_str}, lr: {learning_rate_str}')
         out = synth(z)
-
+        # out = stepify(out)
         # if this image is a new best image or we reached this point due to the 'save every' timer, generate the image.
         generated_image = TF.to_pil_image(out[0].cpu())
 
@@ -663,8 +754,8 @@ def ascend_txt():
         else:
             result.append(prompt(iii))
         
-    img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
-    img = np.transpose(img, (1, 2, 0))
+    # img = np.array(out.mul(255).clamp(0, 255)[0].cpu().detach().numpy().astype(np.uint8))[:,:,:]
+    # img = np.transpose(img, (1, 2, 0))
 
     return result
 
@@ -685,7 +776,7 @@ sched_anneal = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=75, T_mul
 # use another annealer but without increasing steps to make a sort-of wave LR
 # sched_wave = optim.lr_scheduler.CosineAnnealingWarmRestarts(opt, T_0=66, verbose=False)
 if args.lr_opt == "wave":
-    # DO NOT INIT THE LAMBDA LR IF IT IS NOT USED. IT MAY NEVER BE STEPPED, BUT IT WILL SET LR TO IT f(0) ON INIT !!!
+    # DO NOT INIT THE LAMBDA LR IF IT IS NOT USED. IT WILL NEVER BE STEPPED, AND WILL SET LR TO f(0) ON INIT !!!
     sched_wave = optim.lr_scheduler.LambdaLR(opt, lr_wave_lambda)
 
 # print("after sched: ", args.step_size)
@@ -868,8 +959,19 @@ try:
 except FileExistsError as e:
     pass
 except Exception as e:
-    print(f"'outputs' folder could not be created: {e}")
+    print(f"'prompts_log' folder could not be created: {e}")
+
+# try to create 'unpub' folder if not present.
+try:
+    os.makedirs('prompts_log/unpub')
+except FileExistsError as e:
+    pass
+except Exception as e:
+    print(f"'unpub' folder could not be created: {e}")
 
 with open(f"prompts_log/{big_timestamp}.log", "a") as f:
     f.write(promptstring)
     f.write("\n")
+
+with open(f"prompts_log/unpub/{big_timestamp}-{args.output}{timestamp}.txt", "w") as f:
+    f.write(promptstring)
