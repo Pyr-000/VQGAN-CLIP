@@ -24,6 +24,7 @@ from torchvision.transforms import functional as TF
 
 from CLIP import clip
 import kornia.augmentation as K
+import kornia
 import numpy as np
 import imageio
 
@@ -71,35 +72,44 @@ vq_parser.add_argument("-ovf", "--overtime_factor", type=float, help="Allow for 
 vq_parser.add_argument("-nvd", "--no_video", help="Do not add a true video file as an output. (Video requires ffmpeg executable.)", action='store_true', dest='no_video')
 vq_parser.add_argument("-sif", "--save_intermediate_frames", help="Re-save output png on every -se interval. Provides progress updates but slows down the process.", action='store_true', dest='save_intermediate')
 vq_parser.add_argument("-mgs", "--max_gif_size_mb", type=float, help="Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.", default=8, dest='max_gif_size_mb')
-vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_true', dest='no_cudnn_bench')
+vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_false', dest='no_cudnn_bench')
 vq_parser.add_argument("-cdi", "--cuda_device_id", type=int, help="Set CUDA device ID. Only required if a secondary CUDA device is available and should be used.", default=0, dest='cuda_device_id')
 vq_parser.add_argument("-pd", "--plateau_delay", type=float, help="Factor of overall iterations to wait until scheduler is applied in plateau", default=0.08, dest='plateau_delay')
 vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience value for plateau scheduler", default=1, dest='plateau_patience')
 vq_parser.add_argument("-pf", "--plateau_factor", type=float, help="LR factor applied in a plateau step", default=0.8, dest='plateau_factor')
-vq_parser.add_argument("-pne", "--plateau_no_exit_early", help="By default, early exit if min lr is reached by plateau is permitted", action='store_true', dest='exit_early')
+vq_parser.add_argument("-pne", "--plateau_no_exit_early", help="By default, early exit if min lr is reached by plateau is permitted", action='store_false', dest='exit_early')
 vq_parser.add_argument("-pfp", "--prompts_path", help="Read contents of a specified utf-8 text file for the -p (prompts) flag. Overwrites -p.", default=None, dest='prompts_path')
+vq_parser.add_argument("-dp", "--display_progress_interval", type=float, help="Interval (seconds) to display current image while generating. Disabled for >= 0. Requires cv2.", default=0.0, dest='display_progress_interval')
 vq_parser.add_argument("-de", "--dropout_early", type=float, help="p-value for dropout on forward input (before augmentations or cutouts)", default=0.0, dest='dropout_early')
 vq_parser.add_argument("-di", "--dropout_item", type=float, help="p-value for dropout per cutout item, before pooling, augmentation", default=0.002, dest='dropout_item')
 vq_parser.add_argument("-dl", "--dropout_late", type=float, help="p-value for dropout after cutouts, pooling, augmentation", default=0.0, dest='dropout_late')
-vq_parser.add_argument("-dar", "--dropout_alpha_rate", type=float, help="p-value for dropouts to be AlphaDropout (over normal)", default=0.66, dest='dropout_alpha_prob')
-vq_parser.add_argument("-ath", "--apply_tanh_factor", type=float, help="rate for applying tanh to batch items on forward; high values seem to have an effect similar to 'hdr image' filters", default=0.5, dest='apply_tanh')
-vq_parser.add_argument("-nf", "--forward_noise_factor", type=float, help="noise factor applied on forward", default=0.01, dest='forward_noise_fac')
+vq_parser.add_argument("-dar", "--dropout_alpha_rate", type=float, help="p-value for dropouts to be AlphaDropout (over normal)", default=0.8, dest='dropout_alpha_prob')
+vq_parser.add_argument("-aac", "--apply_act_factor", type=float, help="rate for applying tanh to batch items on forward; high values seem to have an effect similar to 'hdr image' filters", default=0.33, dest='apply_act')
+vq_parser.add_argument("-nf", "--forward_noise_factor", type=float, help="noise factor applied on forward", default=0.02, dest='forward_noise_fac')
 vq_parser.add_argument("-mpw", "--max_pooling_weight", type=float, help="weight of max pooling vs average pooling [0..1]", default=0.5, dest='max_pooling_weight')
+vq_parser.add_argument("-Aes", "--augment_erase_same", type=float, help="Augment: p-value of erasing sections in entire batch", default=0.4, dest='aug_erasure_same_p')
+vq_parser.add_argument("-Aei", "--augment_erase_item", type=float, help="Augment: p-value of erasing sections in batch item", default=0.4, dest='aug_erasure_diff_p')
+vq_parser.add_argument("-ssa", "--scale_step_amount", type=float, help="Scaling factor to be applied on forward step. Experimental.", default=1.0, dest='zoom_factor')
+vq_parser.add_argument("-ssf", "--scale_step_frequency", type=int, help="Forward steps between each applied scaling step. Experimental.", default=3, dest='zoom_freq')
+vq_parser.add_argument("-sml", "--scale_min_lr", type=float, help="Minimum active learning rate for enabling scaling.", default=1e-4, dest='zoom_min_lr')
+# TODO: Autoscale zoom rate to make sense with current lr
 
 timeObj = time.localtime(time.time())
 big_timestamp = '%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday)
 
 # Execute the parse_args() method
 args = vq_parser.parse_args()
+if args.display_progress_interval > 0 :
+    try:
+        import cv2
+        global last_progress_display_time
+        last_progress_display_time = time.time()
+    except ImportError as e:
+        print("Error importing cv2. Displaying the current image during generation requires cv2.")
+        raise e
 if not args.no_cudnn_bench:
     print("Running cudnn benchmark to (hopefully) boost performance. Disable with -ncb")
-torch.backends.cudnn.benchmark = not args.no_cudnn_bench	# NR: True is a bit faster, but can lead to OOM. False is also more deterministic.
-
-# flag is a "not"; default is to allow early exit
-if args.exit_early:
-    args.exit_early = False
-else:
-    args.exit_early = True
+torch.backends.cudnn.benchmark = args.no_cudnn_bench	# NR: True is a bit faster, but can lead to OOM. False is also more deterministic.
 
 torch.use_deterministic_algorithms(False)
 
@@ -112,6 +122,9 @@ if args.lr_opt:
     args.lr_opt = args.lr_opt.lower()
 if args.optimiser:
     args.optimiser = args.optimiser.lower()
+# if no lr scheduler is specified, do not use exit early
+if args.lr_opt == 'none':
+    args.exit_early = False
 
 if args.opt_seq:
     print("output will only contain frames with new optimal loss")
@@ -129,7 +142,7 @@ if not args.prompts and not args.negative_prompts:
 
 multiple_prompts_exist = False
 multiprompt_iter = 0
-iter_per_half_cycle = 100
+iter_per_half_cycle = args.max_iterations/2
 # Split text prompts using the pipe character
 if args.prompts:
     multiprompts = [phrase.strip() for phrase in args.prompts.split("|||")]
@@ -137,6 +150,8 @@ if args.prompts:
     if len(multiprompts) <= 1:
         args.prompts = multiprompts[0]
         args.prompts = [phrase.strip() for phrase in args.prompts.split("||")]
+        if args.lr_opt == "wave":
+            args.exit_early = False
     else:
         # for prompt sequence
         multiple_prompts_exist = True
@@ -152,7 +167,8 @@ if args.prompts:
         print(f"Iterations per half-period for prompts: {iter_per_half_cycle}, overall iterations: {args.max_iterations}")
 
 # print(args.step_size)
-
+# args.step_size = 0.33
+# args.plateau_patience = 2
 if args.step_size <= 0.0:
     # print("ADJ")
     # print(args.lr_opt)
@@ -163,7 +179,7 @@ if args.step_size <= 0.0:
     elif args.lr_opt == "wave":
         args.step_size = 0.66
     elif args.lr_opt == "anneal":
-        args.step_size = 1e1
+        args.step_size = 8
     else:
         args.step_size = 1e-1
 
@@ -303,6 +319,17 @@ def stepify(input):
         # out = out + minval
     return out
 
+# zoom by specified factor; if >1, zoom out.
+def zoom_by(input, zoom_fac:float = None):
+    # if no factor is specified, read it from the args.
+    if zoom_fac is None:
+        zoom_fac = args.zoom_factor
+    if zoom_fac < 0 :
+        print(f" Err: invalid zoom factor {zoom_fac} ")
+        return input
+    scale_tensor = torch.tensor(zoom_fac).to(device)
+    return kornia.geometry.transform.scale(tensor=input, scale_factor=scale_tensor, padding_mode='border', align_corners=True)
+
 class Prompt(nn.Module):
     def __init__(self, embed, weight=1., stop=float('-inf')):
         super().__init__()
@@ -371,6 +398,20 @@ class MakeCutouts(nn.Module):
         self.cut_size = cut_size
         self.cutn = cutn
         self.cut_pow = cut_pow
+        self.aug_fac_min = 0.2
+        self.aug_image_noise_std = 0.2
+        self.aug_erasure_same_p = args.aug_erasure_same_p
+        self.aug_erasure_diff_p = args.aug_erasure_diff_p
+        self.aug_perspective_scale = 0.7
+        self.augmod_erasure_same = K.RandomErasing((.1, .4), (.3, 1/.3), same_on_batch=True,  p=self.aug_erasure_same_p)
+        self.augmod_erasure_diff = K.RandomErasing((.1, .4), (.3, 1/.3), same_on_batch=False, p=self.aug_erasure_diff_p)
+        self.augmod_image_noise_diff = K.RandomGaussianNoise(mean=0.0, std=self.aug_image_noise_std, p=0.5)
+        self.augmod_image_noise_same = K.RandomGaussianNoise(mean=0.0, std=self.aug_image_noise_std, p=0.5, same_on_batch=True)
+        self.augmod_random_perspective = K.RandomPerspective(self.aug_perspective_scale,p=0.7)
+        self.augmod_blurs = nn.Sequential(
+            ParallelProcessing(K.RandomGaussianBlur((3,3),(0.1,0.1),p=0.15),K.RandomGaussianBlur((3,3),(0.2,0.2),p=0.15),0.5),
+            ParallelProcessing(K.RandomGaussianBlur((5,5),(0.1,0.1),p=0.15),K.RandomGaussianBlur((5,5),(0.2,0.2),p=0.15),0.5),
+        )
 
         self.augs = nn.Sequential(
             # K.RandomHorizontalFlip(p=0.5),
@@ -380,9 +421,16 @@ class MakeCutouts(nn.Module):
             # K.RandomResizedCrop(size=(self.cut_size,self.cut_size), scale=(0.1,1),  ratio=(0.75,1.333), cropping_mode='resample', p=0.5),
             # K.RandomCrop(size=(self.cut_size,self.cut_size), p=0.5),
             K.RandomAffine(degrees=15, translate=0.1, p=0.7, padding_mode='border'),
-            K.RandomPerspective(0.7,p=0.7),
+            # K.RandomElasticTransform(p=0.1),
+            # K.RandomAffine(degrees=15, translate=0.1, p=0.7),
+            self.augmod_random_perspective,
             K.ColorJitter(hue=0.1, saturation=0.1, p=0.7),
-            K.RandomErasing((.1, .4), (.3, 1/.3), same_on_batch=True, p=0.7),
+            self.augmod_erasure_same,
+            self.augmod_erasure_diff,
+            self.augmod_blurs,
+            self.augmod_image_noise_diff,
+            self.augmod_image_noise_same,
+            # K.RandomGaussianNoise(),
         )
         # random chaos is introduced through dropouts, so this can be -> 0.
         self.noise_fac = args.forward_noise_fac
@@ -406,8 +454,9 @@ class MakeCutouts(nn.Module):
             self.early_dropout,
         )
         self.apply_per_batch_item = nn.Sequential(
-            # MaybeAct(nn.Tanh(), p=args.apply_tanh),
-            ParallelProcessing(nn.Identity(), nn.Tanh(), p=args.apply_tanh),
+            # MaybeAct(nn.Tanh(), p=args.apply_act),
+            ParallelProcessing(nn.Identity(), nn.Tanh(), p=args.apply_act),
+            # ParallelProcessing(nn.Identity(), nn.ELU(), p=args.apply_act),
             self.item_dropout,
         )
         apply_on_out_batch = nn.ModuleList([])
@@ -442,6 +491,13 @@ class MakeCutouts(nn.Module):
             batch = batch + facs * torch.randn_like(batch)
         batch = self.apply_on_out_batch(batch)
         return batch
+
+    def scale_augs(self, fac = 1.0):
+        fac = self.aug_fac_min if fac < self.aug_fac_min else 1 if fac > 1 else fac
+        self.augmod_image_noise_diff.std = self.aug_image_noise_std * fac
+        self.augmod_erasure_same.p = self.augmod_erasure_same.p * fac
+        self.augmod_erasure_diff.p = self.augmod_erasure_diff.p * fac
+        self.augmod_random_perspective.distortion_scale = self.augmod_random_perspective.distortion_scale * fac
 
 
 def load_vqgan_model(config_path, checkpoint_path):
@@ -562,7 +618,7 @@ else:
 
 # Output for the user
 print(f"Using device: {device} [{device_name}]")
-print(f"Optimising using: {opt}")
+print(f"Using optimizer: {opt}")
 
 if args.prompts:
     if multiple_prompts_exist:
@@ -584,7 +640,6 @@ else:
 torch.manual_seed(seed)
 print('Using seed:', seed)
 
-# print("plp", opt)
 
 def load_prompts(i=0):
     global multiprompt_iter
@@ -686,6 +741,7 @@ def checkin(i, losses):
     global unsaved_best_loss_sequence
     global last_saved_frame
     global generated_image
+    global last_synth
 
     losses_str = ', '.join(f'{loss.item():g}' for loss in losses)
     # current_lr = opt.param_groups[0]['lr']
@@ -707,7 +763,8 @@ def checkin(i, losses):
     not_opt_seq_but_timer = (i % args.display_freq == 0 or is_final_frame) and not args.opt_seq
     if new_best_loss or not_opt_seq_but_timer:
         tqdm.write(f'i: {i}, loss: {loss_value:g}, losses: {losses_str}, lr: {learning_rate_str}')
-        out = synth(z)
+        # out = synth(z)
+        out = last_synth
         # out = stepify(out)
         # if this image is a new best image or we reached this point due to the 'save every' timer, generate the image.
         generated_image = TF.to_pil_image(out[0].cpu())
@@ -732,13 +789,29 @@ def checkin(i, losses):
             # save individual frames
             # generated_image.save("outputs/"+str(i).zfill(6)+".png")
             output_frames.append(generated_image)
+            if args.display_progress_interval > 0:
+                global last_progress_display_time
+                if time.time() - last_progress_display_time > args.display_progress_interval:
+                    last_progress_display_time = time.time()
+                    cv2.imshow("Generation Progress", cv2.cvtColor(np.asarray(generated_image), cv2.COLOR_RGB2BGR))
+                    cv2.waitKey(1) # wait 1ms, otherwise the display window may refuse to show the image and freeze up.
     except Exception as e:
         print(e)
 
 
 def ascend_txt():
     global i
+    global last_synth
     out = synth(z)
+    last_synth = out
+    """
+    lr_active = opt.param_groups[0]['lr'] - args.step_size
+    lr_range = plateau_min_lr - args.step_size
+    lr_progression = 1-(lr_active / lr_range)
+    # print(lr_progression)
+    # only start scaling down after >50%, value will be >1.0 before then
+    make_cutouts.scale_augs(lr_progression * 2)
+    """
     iii = perceptor.encode_image(normalize(make_cutouts(out))).float()
     
     result = []
@@ -759,9 +832,6 @@ def ascend_txt():
 
     return result
 
-# print("before sched: ", args.step_size)
-
-# print("ps", opt)
 
 # plateau scheduler, minimum LR is set by an arg - reaching it is used as the exit condition for overtime
 sched_plateau = optim.lr_scheduler.ReduceLROnPlateau(opt, min_lr = plateau_min_lr, verbose=False, factor=args.plateau_factor, patience=args.plateau_patience)
@@ -779,27 +849,27 @@ if args.lr_opt == "wave":
     # DO NOT INIT THE LAMBDA LR IF IT IS NOT USED. IT WILL NEVER BE STEPPED, AND WILL SET LR TO f(0) ON INIT !!!
     sched_wave = optim.lr_scheduler.LambdaLR(opt, lr_wave_lambda)
 
-# print("after sched: ", args.step_size)
 
 def train(i):
-    #print("zg", opt)
+    global z
     # run a step
     opt.zero_grad(set_to_none=True)
     lossAll = ascend_txt()
-    #print("ci", opt)
     # perform checkin (save current frame, get metrics)
     checkin(i, lossAll)
-
     # calculate loss value, run optimiser
     loss = sum(lossAll)
     loss.backward()
-    # print("after loss: ", args.step_size)
-    #print("st", opt)
     opt.step()
-    #print("nd", opt)
-    
+    # print(img_tensor.size())
+    # acquire current lr
+    current_lr = opt.param_groups[0]['lr']
     with torch.no_grad():
-        z.copy_(z.maximum(z_min).minimum(z_max))
+        # if scaling is enabled (factor not 1), apply every n steps, unless below min lr
+        if (args.zoom_factor != 1) and ((i % args.zoom_freq) == 0) and (current_lr >= args.zoom_min_lr):
+            z.copy_(zoom_by(z.maximum(z_min).minimum(z_max)))
+        else:
+            z.copy_(z.maximum(z_min).minimum(z_max))
 
     # apply learning rate schedulers:
     # for annealing, the final few iterations are used to 'clean up' the current image with plateau
@@ -816,11 +886,7 @@ def train(i):
     global multiprompt_iter
     global multiple_prompts_exist
     if multiple_prompts_exist:
-        # print("multiple prompts!")
-        # target_prompt_idx = int((i-iter_per_half_cycle)/(iter_per_half_cycle*2))
-        # if target_prompt_idx > multiprompt_iter and target_prompt_idx < len(multiprompts):
-        #     load_prompts(target_prompt_idx)
-        # hacky solution instead!
+        # hacky solution for prompt sequencing!
         # if int((i / iter_per_half_cycle + 1) / 2) > multiprompt_iter:
         if int((i / iter_per_half_cycle) / 2) > multiprompt_iter:
             if multiprompt_iter + 1 >= len(multiprompts):
@@ -829,9 +895,8 @@ def train(i):
             else:
                 load_prompts(multiprompt_iter + 1)
 
+
 i = 0
-# print("before train: ", args.step_size)
-# print("pt", opt)
 try:
     with tqdm() as pbar:
         while True:
@@ -841,7 +906,7 @@ try:
                 if (max_overtime > 0) and (args.lr_opt in ("anneal", "wave", "plateau")) and (round(current_lr, 8) > round(plateau_min_lr, 8)) and (i < args.max_iterations * max_overtime):
                     # if overtime is allowed, some extra frames can be appended.
                     if i == args.max_iterations:
-                        # only print this message once! (if overtime triggeres, but i is equal to max)
+                        # only print this message once! (if overtime triggers, but i is equal to max)
                         print(f"\nplateau lr:{round(current_lr, 8)} still greater than min: {round(plateau_min_lr, 8)} allowing up to {max_overtime-1} overtime (until i: {int(args.max_iterations * max_overtime)}).")
                         print("This factor can be changed with -ovf, set to 0 to disable.")
                     # pass
@@ -975,3 +1040,6 @@ with open(f"prompts_log/{big_timestamp}.log", "a") as f:
 
 with open(f"prompts_log/unpub/{big_timestamp}-{args.output}{timestamp}.txt", "w") as f:
     f.write(promptstring)
+
+if args.display_progress_interval > 0:
+    cv2.destroyAllWindows()
