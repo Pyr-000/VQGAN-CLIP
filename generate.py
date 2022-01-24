@@ -93,6 +93,7 @@ vq_parser.add_argument("-Aei", "--augment_erase_item", type=float, help="Augment
 vq_parser.add_argument("-ssa", "--scale_step_amount", type=float, help="Scaling factor to be applied on forward step. Experimental.", default=1.0, dest='zoom_factor')
 vq_parser.add_argument("-ssf", "--scale_step_frequency", type=int, help="Forward steps between each applied scaling step. Experimental.", default=3, dest='zoom_freq')
 vq_parser.add_argument("-sml", "--scale_min_lr", type=float, help="Minimum active learning rate for enabling scaling.", default=1e-4, dest='zoom_min_lr')
+vq_parser.add_argument("-wpl", "--webp_lossless", help="Generate lossless webp", action="store_true", dest='webp_lossless')
 # TODO: Autoscale zoom rate to make sense with current lr
 
 timeObj = time.localtime(time.time())
@@ -215,7 +216,7 @@ timeObj = time.localtime(time.time())
 timestamp = '%d_%d_%d-%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday, timeObj.tm_hour, timeObj.tm_min, timeObj.tm_sec)
 image_basepath = f"outputs/{big_timestamp}/" + args.output + timestamp
 png_file_path =  image_basepath + ".png"
-grid_file_path = image_basepath + "_grid.png"
+grid_file_path = image_basepath + "_grid"
 # try to create 'outputs' folder if not present.
 try:
     os.makedirs('outputs')
@@ -1075,9 +1076,26 @@ if should_make_video:
         os.remove(video_file_path+"n.mp4")
 
 if should_make_grid:
-    grid = image_autogrid(output_frames)
-    grid.save(grid_file_path)
+    try:
+        grid = image_autogrid(output_frames)
+        try:
+            if args.webp_lossless:
+                grid.save(grid_file_path+".webp", lossless=True, method=6)
+            else:
+                grid.save(grid_file_path+".webp", quality=90, method=6)
+        except Exception as e:
+            print(f"{e}\nCould not generate grid as webp. Falling back to png.")
+            grid.save(grid_file_path+".png")
+    except Exception as e:
+        print("Failed to generate image grid: {e}")
 
+try:
+    if args.webp_lossless:
+        generated_image.save(fp=image_basepath+"_a.webp", format='webp', append_images=output_frames, save_all=True, duration=33, minimize_size=True, loop=1, lossless=True)
+    else:
+        generated_image.save(fp=image_basepath+"_a.webp", format='webp', append_images=output_frames, save_all=True, duration=33, minimize_size=True, loop=1)
+except Exception as e:
+    print("Could not generate animated webp image: {e}")
 
 print(promptstring)
 
