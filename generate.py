@@ -69,7 +69,8 @@ vq_parser.add_argument("-lo", "--lr_optimiser", type=str, help="Learning rate op
 vq_parser.add_argument("-osq", "--optimal_sequence", help="Only output frames with new optimal loss", action='store_true', dest='opt_seq')
 # vq_parser.add_argument("-nov", "--no_overtime", help="Do not allow for some extra iterations during the cleanup (plateau) pass", action='store_true', dest='no_overtime')
 vq_parser.add_argument("-ovf", "--overtime_factor", type=float, help="Allow for some extra iterations during the cleanup (plateau) pass. Factor of iteration count.", default=0.25, dest='overtime_factor')
-vq_parser.add_argument("-nvd", "--no_video", help="Do not add a true video file as an output. (Video requires ffmpeg executable.)", action='store_true', dest='no_video')
+vq_parser.add_argument("-nfg", "--no_frames_grid", help="Do not generate a grid image of all frames", action='store_false', dest='frames_grid')
+vq_parser.add_argument("-nvd", "--no_video", help="Do not add a true video file as an output. (Video requires ffmpeg executable.)", action='store_false', dest='video_out')
 vq_parser.add_argument("-sif", "--save_intermediate_frames", help="Re-save output png on every -se interval. Provides progress updates but slows down the process.", action='store_true', dest='save_intermediate')
 vq_parser.add_argument("-mgs", "--max_gif_size_mb", type=float, help="Size limit for the gif file in MB. Intermediate frames will be dropped until this fits.", default=8, dest='max_gif_size_mb')
 vq_parser.add_argument("-ncb", "--no_cudnn_benchmark", help="Don't run cudnn benchmark (normally used to optimise processing performance)", action='store_false', dest='no_cudnn_bench')
@@ -79,7 +80,7 @@ vq_parser.add_argument("-pp", "--plateau_patience", type=int, help="Patience val
 vq_parser.add_argument("-pf", "--plateau_factor", type=float, help="LR factor applied in a plateau step", default=0.8, dest='plateau_factor')
 vq_parser.add_argument("-pne", "--plateau_no_exit_early", help="By default, early exit if min lr is reached by plateau is permitted", action='store_false', dest='exit_early')
 vq_parser.add_argument("-pfp", "--prompts_path", help="Read contents of a specified utf-8 text file for the -p (prompts) flag. Overwrites -p.", default=None, dest='prompts_path')
-vq_parser.add_argument("-dp", "--display_progress_interval", type=float, help="Interval (seconds) to display current image while generating. Disabled for >= 0. Requires cv2.", default=0.0, dest='display_progress_interval')
+vq_parser.add_argument("-dp", "--display_progress_interval", type=float, help="Interval (seconds) to display current image while generating. Disabled for <= 0. Requires cv2.", default=1.0, dest='display_progress_interval')
 vq_parser.add_argument("-de", "--dropout_early", type=float, help="p-value for dropout on forward input (before augmentations or cutouts)", default=0.0, dest='dropout_early')
 vq_parser.add_argument("-di", "--dropout_item", type=float, help="p-value for dropout per cutout item, before pooling, augmentation", default=0.002, dest='dropout_item')
 vq_parser.add_argument("-dl", "--dropout_late", type=float, help="p-value for dropout after cutouts, pooling, augmentation", default=0.0, dest='dropout_late')
@@ -106,14 +107,15 @@ if args.display_progress_interval > 0 :
         last_progress_display_time = time.time()
     except ImportError as e:
         print("Error importing cv2. Displaying the current image during generation requires cv2.")
-        raise e
+        args.display_progress_interval = 0
 if not args.no_cudnn_bench:
     print("Running cudnn benchmark to (hopefully) boost performance. Disable with -ncb")
 torch.backends.cudnn.benchmark = args.no_cudnn_bench	# NR: True is a bit faster, but can lead to OOM. False is also more deterministic.
 
 torch.use_deterministic_algorithms(False)
 
-should_make_video = not args.no_video
+should_make_grid = args.frames_grid
+should_make_video = args.video_out
 max_overtime = 1+args.overtime_factor
 plateau_min_lr = args.plateau_min_lr
 
@@ -211,7 +213,9 @@ lr_wave_lambda = lambda i : math.pow((math.pow(2,(math.cos(i/sincos_scale_factor
 # init. output file timestamp
 timeObj = time.localtime(time.time())
 timestamp = '%d_%d_%d-%d_%d_%d' % (timeObj.tm_year, timeObj.tm_mon, timeObj.tm_mday, timeObj.tm_hour, timeObj.tm_min, timeObj.tm_sec)
-png_file_path = f"outputs/{big_timestamp}/" + args.output + timestamp + ".png"
+image_basepath = f"outputs/{big_timestamp}/" + args.output + timestamp
+png_file_path =  image_basepath + ".png"
+grid_file_path = image_basepath + "_grid.png"
 # try to create 'outputs' folder if not present.
 try:
     os.makedirs('outputs')
@@ -598,7 +602,8 @@ z.requires_grad_(True)
 pMs = []
 normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                   std=[0.26862954, 0.26130258, 0.27577711])
-
+# normalize = transforms.Normalize(mean=[0.45, 0.45, 0.45],
+#                                   std=[0.3, 0.3, 0.3])
 
 # Set the optimiser
 # print(args.step_size)
@@ -611,10 +616,22 @@ elif args.optimiser == "adagrad":
 elif args.optimiser == "adamax":
     opt = optim.Adamax([z], lr=args.step_size)	# LR=0.2
 elif args.optimiser == "sgd":
-    args.step_size *= 5000
+    args.step_size *= 1e6
     opt = optim.SGD([z], lr=args.step_size, momentum=1)
+elif args.optimiser == "asgd":
+    args.step_size *= 1e6
+    opt = optim.ASGD([z], lr=args.step_size)
+elif args.optimiser == "lbfgs":
+    opt = optim.LBFGS([z], lr=args.step_size)
+elif args.optimiser == "rprop":
+    opt = optim.Rprop([z], lr=args.step_size)
+elif args.optimiser == "rmsprop":
+    opt = optim.RMSprop([z], lr=args.step_size)
+elif args.optimiser == "adadelta":
+    opt = optim.Adadelta([z], lr=args.step_size)
 else:
     print("WARNING: unknown optimiser requested!")
+    exit()
 
 # Output for the user
 print(f"Using device: {device} [{device_name}]")
@@ -793,7 +810,7 @@ def checkin(i, losses):
                 global last_progress_display_time
                 if time.time() - last_progress_display_time > args.display_progress_interval:
                     last_progress_display_time = time.time()
-                    cv2.imshow("Generation Progress", cv2.cvtColor(np.asarray(generated_image), cv2.COLOR_RGB2BGR))
+                    cv2.imshow(promptstring, cv2.cvtColor(np.asarray(generated_image), cv2.COLOR_RGB2BGR))
                     cv2.waitKey(1) # wait 1ms, otherwise the display window may refuse to show the image and freeze up.
     except Exception as e:
         print(e)
@@ -850,17 +867,33 @@ if args.lr_opt == "wave":
     sched_wave = optim.lr_scheduler.LambdaLR(opt, lr_wave_lambda)
 
 
-def train(i):
-    global z
-    # run a step
+# use i from global if not specified.
+def compute_loss(step = -1):
     opt.zero_grad(set_to_none=True)
+    global last_loss
+    if step < 0:
+        global i
+        step = i
     lossAll = ascend_txt()
     # perform checkin (save current frame, get metrics)
-    checkin(i, lossAll)
+    checkin(step, lossAll)
     # calculate loss value, run optimiser
-    loss = sum(lossAll)
-    loss.backward()
-    opt.step()
+    loss_sum = sum(lossAll)
+    last_loss = loss_sum.item()
+    loss_sum.backward()
+    return loss_sum
+
+def train(i):
+    global z
+    global last_loss
+    loss = 0
+    # run a step
+    if args.optimiser == "lbfgs":
+        opt.step(compute_loss)
+        loss = last_loss
+    else:
+        loss = compute_loss(i)
+        opt.step()
     # print(img_tensor.size())
     # acquire current lr
     current_lr = opt.param_groups[0]['lr']
@@ -929,6 +962,31 @@ for i in range(1,5):
         continue
     break
 
+# function to create one image containing all input images in a grid.
+# currently not intended for images of differing sizes.
+def image_autogrid(imgs):
+    # additional image separation (pixels of padding), between grid items.
+    GRID_IMAGE_SEPARATION = 10
+    side_len = math.sqrt(len(imgs))
+    # round up cols from square root, attempt to round down rows
+    # if required to actually fit all images, both cols and rows are rounded up.
+    cols = math.ceil(side_len)
+    rows = math.floor(side_len)
+    if (rows*cols) < len(imgs):
+        rows = math.ceil(side_len)
+
+    # get grid item size from first image
+    w, h = imgs[0].size
+    # add separation to size between images as 'padding'
+    w += GRID_IMAGE_SEPARATION
+    h += GRID_IMAGE_SEPARATION
+    # remove one image separation size from the overall size (no added padding after the final row/col)
+    grid = Image.new('RGB', size=(cols*w-GRID_IMAGE_SEPARATION, rows*h-GRID_IMAGE_SEPARATION))
+    grid_w, grid_h = grid.size
+    
+    for i, img in enumerate(imgs):
+        grid.paste(img, box=(i%cols*w, i//cols*h))
+    return grid
 
 # function to write a list of frames to a gif file
 def gif_frames_to_file(frames, path):
@@ -1015,6 +1073,11 @@ if should_make_video:
     else:
         print("ffmpeg call returned code 0. Removing intermediary file without thumbnail.")
         os.remove(video_file_path+"n.mp4")
+
+if should_make_grid:
+    grid = image_autogrid(output_frames)
+    grid.save(grid_file_path)
+
 
 print(promptstring)
 
